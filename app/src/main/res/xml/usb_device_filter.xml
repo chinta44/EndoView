@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Video class (0x0e) デバイス全般を対象にする。特定機種に絞らない汎用指定 -->
+<resources>
+    <usb-device class="14" />
+</resources>
