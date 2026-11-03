@@ -812,6 +812,8 @@ class MainActivity : AppCompatActivity() {
         ).forEach { it.isEnabled = connected }
         binding.btnRecord.isEnabled = connected
         binding.btnResolution.isEnabled = connected && !vendorActive
+        // 解像度が固定の独自プロトコル機ではボタンを丸ごと隠す
+        binding.btnResolution.visibility = if (vendorActive) View.GONE else View.VISIBLE
         if (!connected) binding.controlsPanel.visibility = View.GONE
         if (connected) scheduleControlsHide()
     }

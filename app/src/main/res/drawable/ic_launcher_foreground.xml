@@ -4,15 +4,37 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- 内視鏡プローブ (円+ケーブル) の簡易アイコン -->
+    <!-- キラキラ -->
+    <path
+        android:fillColor="#FFF9C4"
+        android:pathData="M25,15 L28.5,21.5 L35,25 L28.5,28.5 L25,35 L21.5,28.5 L15,25 L21.5,21.5 Z" />
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,30 m-16,0 a16,16 0,1 1,32 0 a16,16 0,1 1,-32 0" />
-    <path
-        android:fillColor="#1565C0"
-        android:pathData="M54,38 m-8,0 a8,8 0,1 1,16 0 a8,8 0,1 1,-16 0" />
+        android:pathData="M85,17 L87.5,21.5 L92,24 L87.5,26.5 L85,31 L82.5,26.5 L78,24 L82.5,21.5 Z" />
+    <!-- ケーブル -->
     <path
         android:strokeColor="#FFFFFF"
-        android:strokeWidth="5"
-        android:pathData="M62,62 C78,74 84,80 84,92" />
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M63,60 C80,68 88,76 86,88" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M86,90 m-4.5,0 a4.5,4.5 0,1 1,9 0 a4.5,4.5 0,1 1,-9 0" />
+    <!-- レンズ -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M50,50 m-19,0 a19,19 0,1 1,38 0 a19,19 0,1 1,-38 0" />
+    <path
+        android:fillColor="#FF4081"
+        android:pathData="M50,50 m-13,0 a13,13 0,1 1,26 0 a13,13 0,1 1,-26 0" />
+    <path
+        android:fillColor="#263238"
+        android:pathData="M50,50 m-7,0 a7,7 0,1 1,14 0 a7,7 0,1 1,-14 0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46.5,45.5 m-2.6,0 a2.6,2.6 0,1 1,5.2 0 a2.6,2.6 0,1 1,-5.2 0" />
+    <!-- ドット -->
+    <path
+        android:fillColor="#B3FFFFFF"
+        android:pathData="M22,80 m-3,0 a3,3 0,1 1,6 0 a3,3 0,1 1,-6 0" />
 </vector>
