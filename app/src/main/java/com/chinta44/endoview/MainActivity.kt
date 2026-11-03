@@ -5,11 +5,13 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
+import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbDevice
@@ -20,6 +22,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Log
 import android.view.GestureDetector
@@ -33,10 +36,13 @@ import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.chinta44.endoview.databinding.ActivityMainBinding
 import com.herohan.uvcapp.CameraException
 import com.herohan.uvcapp.CameraHelper
@@ -98,6 +104,29 @@ class MainActivity : AppCompatActivity() {
     private var vendorRecorder: VendorRecorder? = null
     private var pendingVideoUri: Uri? = null
     private var logVisible = true
+
+    // v0.4.0 (保存先 / 没入表示)
+    private val prefs by lazy { getSharedPreferences("endoview", MODE_PRIVATE) }
+    private val idleHandler = Handler(Looper.getMainLooper())
+    private var controlsHidden = false
+    private val hideControlsRunnable = Runnable { hideControls() }
+    private val folderPicker = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // 権限が取れなくても URI は保存し、書き込み時に判定する
+            }
+            prefs.edit().putString("save_tree", uri.toString())
+                .putString("save_dest", "saf").apply()
+            toast("保存先フォルダを設定しました")
+        }
+    }
 
     private val handler = Handler(Looper.getMainLooper())
     private var recordStart = 0L
@@ -202,8 +231,10 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         title = "EndoView 内視鏡 v${appVersionName()}"
-        logVisible = getSharedPreferences("endoview", MODE_PRIVATE)
-            .getBoolean("log_visible", true)
+        supportActionBar?.hide()
+        WindowInsetsControllerCompat(window, binding.root).systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        logVisible = prefs.getBoolean("log_visible", true)
         binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
         logEvent("EndoView v${appVersionName()} を起動しました")
 
@@ -244,6 +275,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        idleHandler.removeCallbacks(hideControlsRunnable)
+        if (controlsHidden) showControls()
         if (recording) stopRecording()
         stopVendorDriver()
         clearCameraHelper()
@@ -286,13 +319,18 @@ class MainActivity : AppCompatActivity() {
                 cameraHelper?.addSurface(surface, false)
             }
 
-            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, w: Int, h: Int) {
+                applyPreviewFill()
+            }
             override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
                 cameraHelper?.removeSurface(surface)
                 return false
             }
 
             override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+        }
+        binding.preview.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            applyPreviewFill()
         }
     }
 
@@ -775,17 +813,18 @@ class MainActivity : AppCompatActivity() {
         binding.btnRecord.isEnabled = connected
         binding.btnResolution.isEnabled = connected && !vendorActive
         if (!connected) binding.controlsPanel.visibility = View.GONE
+        if (connected) scheduleControlsHide()
     }
 
     // ---------- ボタン類 ----------
 
     private fun setupButtons() {
         binding.btnDevices.setOnClickListener { showDevicePicker() }
+        binding.btnSaveDest.setOnClickListener { showSaveDestDialog() }
         binding.btnLogToggle.setOnClickListener {
             logVisible = !logVisible
             binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
-            getSharedPreferences("endoview", MODE_PRIVATE).edit()
-                .putBoolean("log_visible", logVisible).apply()
+            prefs.edit().putBoolean("log_visible", logVisible).apply()
             toast(if (logVisible) "接続ログを表示します" else "接続ログを隠します")
         }
         binding.btnPhoto.setOnClickListener { takePicture() }
@@ -794,8 +833,13 @@ class MainActivity : AppCompatActivity() {
         }
         binding.btnFreeze.setOnClickListener { toggleFreeze() }
         binding.btnControls.setOnClickListener {
-            binding.controlsPanel.visibility =
-                if (binding.controlsPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            val opening = binding.controlsPanel.visibility != View.VISIBLE
+            binding.controlsPanel.visibility = if (opening) View.VISIBLE else View.GONE
+            if (opening) {
+                idleHandler.removeCallbacks(hideControlsRunnable)
+            } else {
+                scheduleControlsHide()
+            }
         }
         binding.btnRotate.setOnClickListener { rotateBy90() }
         binding.btnMirror.setOnClickListener { cycleMirror() }
@@ -946,6 +990,144 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------- 保存先 ----------
+
+    private fun saveDestKey(): String = prefs.getString("save_dest", "endoview") ?: "endoview"
+
+    private fun photoRelativePath(): String = when (saveDestKey()) {
+        "camera" -> "DCIM/Camera"
+        "root" -> "Pictures"
+        "download" -> "Download"
+        else -> "Pictures/EndoView"
+    }
+
+    private fun videoRelativePath(): String = when (saveDestKey()) {
+        "camera" -> "DCIM/Camera"
+        "root" -> "Movies"
+        "download" -> "Download"
+        else -> "Movies/EndoView"
+    }
+
+    private fun saveDestLabel(isVideo: Boolean): String = when (saveDestKey()) {
+        "saf" -> "指定フォルダ"
+        "camera" -> "DCIM/Camera"
+        "root" -> if (isVideo) "Movies" else "Pictures"
+        "download" -> "Download"
+        else -> if (isVideo) "Movies/EndoView" else "Pictures/EndoView"
+    }
+
+    /** 保存先の URI を作る。フォルダ指定 (SAF) が使えない場合は MediaStore にフォールバック */
+    private fun createSaveUri(name: String, mime: String, isVideo: Boolean, pending: Boolean): Uri? {
+        if (saveDestKey() == "saf") {
+            createSafUri(name, mime)?.let { return it }
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, if (isVideo) videoRelativePath() else photoRelativePath())
+            if (pending) put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val collection = if (isVideo) {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+        return contentResolver.insert(collection, values)
+    }
+
+    private fun createSafUri(name: String, mime: String): Uri? {
+        val treeStr = prefs.getString("save_tree", null) ?: return null
+        return try {
+            val treeUri = Uri.parse(treeStr)
+            val parent = DocumentsContract.buildDocumentUriUsingTree(
+                treeUri, DocumentsContract.getTreeDocumentId(treeUri)
+            )
+            DocumentsContract.createDocument(contentResolver, parent, mime, name)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun showSaveDestDialog() {
+        val keys = arrayOf("endoview", "camera", "root", "download", "saf")
+        val labels = arrayOf(
+            "EndoView フォルダ (標準)", "カメラと同じ場所 (DCIM/Camera)",
+            "Pictures / Movies の直下", "ダウンロード (Download)", "フォルダを指定…"
+        )
+        val current = keys.indexOf(saveDestKey()).coerceAtLeast(0)
+        AlertDialog.Builder(this)
+            .setTitle("保存先")
+            .setSingleChoiceItems(labels, current) { dialog, which ->
+                dialog.dismiss()
+                if (keys[which] == "saf") {
+                    folderPicker.launch(null)
+                } else {
+                    prefs.edit().putString("save_dest", keys[which]).apply()
+                    toast("保存先を変更しました")
+                }
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
+    // ---------- 没入表示 (操作系の自動非表示) ----------
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_DOWN) {
+            if (controlsHidden) showControls()
+            scheduleControlsHide()
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun scheduleControlsHide() {
+        idleHandler.removeCallbacks(hideControlsRunnable)
+        idleHandler.postDelayed(hideControlsRunnable, 3500)
+    }
+
+    private fun hideControls() {
+        if (!connected || recording || frozen) return
+        if (binding.controlsPanel.visibility == View.VISIBLE) return
+        controlsHidden = true
+        listOf(binding.topBar, binding.sideBar, binding.bottomBar).forEach { v ->
+            v.animate().alpha(0f).setDuration(250)
+                .withEndAction { v.visibility = View.INVISIBLE }.start()
+        }
+        WindowInsetsControllerCompat(window, binding.root)
+            .hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    private fun showControls() {
+        controlsHidden = false
+        listOf(binding.topBar, binding.sideBar, binding.bottomBar).forEach { v ->
+            v.animate().cancel()
+            v.visibility = View.VISIBLE
+            v.animate().alpha(1f).setDuration(200).start()
+        }
+        WindowInsetsControllerCompat(window, binding.root)
+            .show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    /** UVC プレビューを画面いっぱいに表示する (はみ出し分は切り取る) */
+    private fun applyPreviewFill() {
+        val pv = binding.preview
+        val container = binding.previewContainer
+        if (pv.width == 0 || pv.height == 0 || container.width == 0 || container.height == 0) return
+        val z = maxOf(
+            container.width.toFloat() / pv.width,
+            container.height.toFloat() / pv.height
+        )
+        val m = Matrix()
+        if (z > 1f) m.setScale(z, z, pv.width / 2f, pv.height / 2f)
+        pv.setTransform(m)
+    }
+
+    private fun setRecordUi(rec: Boolean) {
+        binding.btnRecord.setImageResource(if (rec) R.drawable.ic_stop else R.drawable.ic_video)
+        binding.btnRecord.backgroundTintList =
+            if (rec) ColorStateList.valueOf(Color.parseColor("#B71C1C")) else null
+    }
+
     // ---------- 写真 / 動画 ----------
 
     private fun timestamp(): String =
@@ -961,14 +1143,14 @@ class MainActivity : AppCompatActivity() {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "ENDO_${timestamp()}.jpg")
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/EndoView")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, photoRelativePath())
         }
         val options = IImageCapture.OutputFileOptions.Builder(
             contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
         ).build()
         helper.takePicture(options, object : IImageCapture.OnImageCaptureCallback {
             override fun onImageSaved(results: IImageCapture.OutputFileResults) {
-                runOnUiThread { toast("写真を保存しました (Pictures/EndoView)") }
+                runOnUiThread { toast("写真を保存しました (${saveDestLabel(false)})") }
             }
 
             override fun onError(code: Int, message: String, cause: Throwable?) {
@@ -1000,19 +1182,14 @@ class MainActivity : AppCompatActivity() {
                 transformed.compress(Bitmap.CompressFormat.JPEG, 92, out)
                 out.toByteArray()
             }
-            val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, "ENDO_${timestamp()}.jpg")
-                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/EndoView")
-            }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            val uri = createSaveUri("ENDO_${timestamp()}.jpg", "image/jpeg", false, false)
             var ok = false
             if (uri != null) {
                 contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
                 ok = true
             }
             runOnUiThread {
-                toast(if (ok) "写真を保存しました (Pictures/EndoView)" else "写真の保存に失敗しました")
+                toast(if (ok) "写真を保存しました (${saveDestLabel(false)})" else "写真の保存に失敗しました")
             }
         }
     }
@@ -1020,13 +1197,7 @@ class MainActivity : AppCompatActivity() {
     /** ベンダー経路の録画開始 (H.264 / MP4、無音) */
     private fun startVendorRecording() {
         if (!connected || recording) return
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "ENDO_${timestamp()}.mp4")
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/EndoView")
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }
-        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        val uri = createSaveUri("ENDO_${timestamp()}.mp4", "video/mp4", true, true)
         if (uri == null) {
             toast("録画を開始できませんでした")
             return
@@ -1049,15 +1220,17 @@ class MainActivity : AppCompatActivity() {
                 vendorRecorder = null
                 if (doneUri != null) {
                     if (ok) {
-                        val done = ContentValues().apply {
-                            put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        if (doneUri.authority == "media") {
+                            val done = ContentValues().apply {
+                                put(MediaStore.MediaColumns.IS_PENDING, 0)
+                            }
+                            try {
+                                contentResolver.update(doneUri, done, null, null)
+                            } catch (e: Exception) {
+                                // 無視
+                            }
                         }
-                        try {
-                            contentResolver.update(doneUri, done, null, null)
-                        } catch (e: Exception) {
-                            // 無視
-                        }
-                        toast("動画を保存しました (Movies/EndoView)")
+                        toast("動画を保存しました (${saveDestLabel(true)})")
                     } else {
                         try {
                             contentResolver.delete(doneUri, null, null)
@@ -1073,7 +1246,7 @@ class MainActivity : AppCompatActivity() {
         if (rec.start(pfd)) {
             vendorRecorder = rec
             recording = true
-            binding.btnRecord.text = "⏹ 停止"
+            setRecordUi(true)
             binding.recordTime.visibility = View.VISIBLE
             recordStart = SystemClock.elapsedRealtime()
             handler.post(recordTick)
@@ -1100,7 +1273,7 @@ class MainActivity : AppCompatActivity() {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "ENDO_${timestamp()}.mp4")
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/EndoView")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, videoRelativePath())
         }
         val options = VideoCapture.OutputFileOptions.Builder(
             contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
@@ -1109,7 +1282,7 @@ class MainActivity : AppCompatActivity() {
             override fun onStart() {
                 runOnUiThread {
                     recording = true
-                    binding.btnRecord.text = "⏹ 停止"
+                    setRecordUi(true)
                     binding.recordTime.visibility = View.VISIBLE
                     recordStart = SystemClock.elapsedRealtime()
                     handler.post(recordTick)
@@ -1119,7 +1292,7 @@ class MainActivity : AppCompatActivity() {
             override fun onVideoSaved(results: VideoCapture.OutputFileResults) {
                 runOnUiThread {
                     finishRecordingUi()
-                    toast("動画を保存しました (Movies/EndoView)")
+                    toast("動画を保存しました (${saveDestLabel(true)})")
                 }
             }
 
@@ -1146,7 +1319,7 @@ class MainActivity : AppCompatActivity() {
         recording = false
         handler.removeCallbacks(recordTick)
         binding.recordTime.visibility = View.GONE
-        binding.btnRecord.text = "🎥 録画"
+        setRecordUi(false)
     }
 
     // ---------- フリーズ / ズーム ----------
@@ -1156,7 +1329,7 @@ class MainActivity : AppCompatActivity() {
             binding.freezeImage.visibility = View.GONE
             binding.freezeImage.setImageBitmap(null)
             frozen = false
-            binding.btnFreeze.text = "❄ フリーズ"
+            binding.btnFreeze.backgroundTintList = null
             return
         }
         val bmp = if (vendorActive) lastFrameBitmap
@@ -1169,7 +1342,8 @@ class MainActivity : AppCompatActivity() {
         resetFreezeTransform()
         binding.freezeImage.visibility = View.VISIBLE
         frozen = true
-        binding.btnFreeze.text = "▶ 再開"
+        binding.btnFreeze.backgroundTintList =
+            ColorStateList.valueOf(Color.parseColor("#EF6C00"))
         toast("フリーズ中: ピンチで拡大、ドラッグで移動できます")
     }
 
