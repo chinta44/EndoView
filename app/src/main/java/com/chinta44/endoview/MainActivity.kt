@@ -30,6 +30,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.chinta44.endoview.databinding.ActivityMainBinding
+import com.herohan.uvcapp.CameraException
 import com.herohan.uvcapp.CameraHelper
 import com.herohan.uvcapp.ICameraHelper
 import com.herohan.uvcapp.IImageCapture
@@ -38,6 +39,8 @@ import com.serenegiant.opengl.renderer.MirrorMode
 import com.serenegiant.usb.IButtonCallback
 import com.serenegiant.usb.Size
 import com.serenegiant.usb.UVCControl
+import com.serenegiant.usb.UVCParam
+import com.serenegiant.usb.UVCCamera
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -58,6 +61,11 @@ class MainActivity : AppCompatActivity() {
     private var frozen = false
     private var rotation = 0
     private var mirrorMode = MirrorMode.MIRROR_NORMAL
+
+    // v0.1.1 診断用: カメラ起動のリトライ段階と接続ログ
+    private var openRetryStage = 0
+    private var launchIntentHandled = false
+    private val logLines = mutableListOf<String>()
 
     private val handler = Handler(Looper.getMainLooper())
     private var recordStart = 0L
@@ -177,6 +185,14 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         initCameraHelper()
+        // USB接続インテントで起動された場合、そのデバイスを拾う (初回のみ)
+        if (!launchIntentHandled) {
+            launchIntentHandled = true
+            usbDeviceFromIntent(intent)?.let {
+                logEvent("起動インテントからデバイスを検出")
+                attachDevice(it)
+            }
+        }
     }
 
     override fun onStop() {
@@ -244,8 +260,97 @@ class MainActivity : AppCompatActivity() {
     private fun attachDevice(device: UsbDevice) {
         if (currentDevice == null && !connected) {
             currentDevice = device
+            logEvent("接続を開始します")
             selectDevice(device)
         }
+    }
+
+    // ---------- v0.1.1 診断ログ ----------
+
+    private fun logEvent(msg: String) {
+        Log.d(TAG, msg)
+        val time = SimpleDateFormat("HH:mm:ss", Locale.JAPAN).format(Date())
+        synchronized(logLines) {
+            logLines.add("$time $msg")
+            while (logLines.size > 9) logLines.removeAt(0)
+        }
+        runOnUiThread {
+            binding.debugLog.visibility = View.VISIBLE
+            binding.debugLog.text = synchronized(logLines) { logLines.joinToString("\n") }
+        }
+    }
+
+    private fun describeDevice(device: UsbDevice): String {
+        val ifs = StringBuilder()
+        for (i in 0 until device.interfaceCount) {
+            val intf = device.getInterface(i)
+            if (i > 0) ifs.append(", ")
+            ifs.append("${intf.interfaceClass}/${intf.interfaceSubclass}/${intf.interfaceProtocol}")
+        }
+        return String.format(
+            Locale.JAPAN, "%s VID:%04X PID:%04X class:%d/%d/%d IF:[%s]",
+            device.productName ?: device.deviceName, device.vendorId, device.productId,
+            device.deviceClass, device.deviceSubclass, device.deviceProtocol, ifs.toString()
+        )
+    }
+
+    /** カメラ起動。失敗したら onError 側で段階を進めてここを呼び直す */
+    private fun doOpenCamera(device: UsbDevice) {
+        val helper = cameraHelper ?: return
+        try {
+            when (openRetryStage) {
+                0 -> {
+                    logEvent("カメラ起動を試みます (標準)")
+                    helper.openCamera()
+                }
+                1 -> {
+                    logEvent("再試行1: 帯域クアーク付きで起動")
+                    helper.openCamera(UVCParam(null, UVCCamera.UVC_QUIRK_FIX_BANDWIDTH))
+                }
+                2 -> {
+                    logEvent("再試行2: MJPEG 640x480 を指定して起動")
+                    helper.openCamera(Size(UVCCamera.UVC_VS_FRAME_MJPEG, 640, 480, 30, listOf(30)))
+                }
+                else -> {
+                    logEvent("再試行3: MJPEG 640x480 + クアーク付きで起動")
+                    helper.openCamera(
+                        UVCParam(
+                            Size(UVCCamera.UVC_VS_FRAME_MJPEG, 640, 480, 30, listOf(30)),
+                            UVCCamera.UVC_QUIRK_FIX_BANDWIDTH
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            logEvent("起動呼び出しで例外: ${e.message}")
+        }
+    }
+
+    /** 接続中 USB デバイスの一覧から手動で選んで接続する */
+    private fun showDevicePicker() {
+        val usbManager = getSystemService(UsbManager::class.java)
+        val devices = usbManager?.deviceList?.values?.toList().orEmpty()
+        if (devices.isEmpty()) {
+            toast("USBデバイスが見つかりません")
+            logEvent("デバイス一覧: なし")
+            return
+        }
+        devices.forEach { logEvent("候補: ${describeDevice(it)}") }
+        val labels = devices.map {
+            String.format(
+                Locale.JAPAN, "%s (VID:%04X PID:%04X)",
+                it.productName ?: it.deviceName, it.vendorId, it.productId
+            )
+        }
+        AlertDialog.Builder(this)
+            .setTitle("接続するUSBデバイス")
+            .setItems(labels.toTypedArray()) { _, which ->
+                currentDevice = null
+                openRetryStage = 0
+                attachDevice(devices[which])
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
     }
 
     private fun selectDevice(device: UsbDevice) {
@@ -276,12 +381,15 @@ class MainActivity : AppCompatActivity() {
 
     private val stateCallback = object : ICameraHelper.StateCallback {
         override fun onAttach(device: UsbDevice) {
+            logEvent("検出: ${describeDevice(device)}")
             attachDevice(device)
         }
 
         override fun onDeviceOpen(device: UsbDevice, isFirstOpen: Boolean) {
             val helper = cameraHelper ?: return
-            helper.openCamera()
+            logEvent("デバイスを開きました")
+            openRetryStage = 0
+            doOpenCamera(device)
             // 内視鏡側の物理ボタン (シャッター) でも写真を撮れるようにする
             helper.setButtonCallback(IButtonCallback { _, state ->
                 if (state == 1) runOnUiThread { takePicture() }
@@ -296,6 +404,11 @@ class MainActivity : AppCompatActivity() {
                 binding.preview.setAspectRatio(size.width, size.height)
             }
             connected = true
+            val sizes = try { helper.supportedSizeList } catch (e: Exception) { null }
+            val sizeText = sizes?.let { list ->
+                "対応サイズ${list.size}件: " + list.take(6).joinToString { "${it.width}x${it.height}" }
+            } ?: ""
+            logEvent("カメラ起動OK ${helper.previewSize?.width}x${helper.previewSize?.height} $sizeText")
             runOnUiThread {
                 updateConnectedUI()
                 showDeviceInfo(device)
@@ -310,13 +423,38 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { updateConnectedUI() }
         }
 
-        override fun onDeviceClose(device: UsbDevice) {}
+        override fun onDeviceClose(device: UsbDevice) {
+            logEvent("デバイスを閉じました")
+        }
+
         override fun onDetach(device: UsbDevice) {
+            logEvent("取り外されました")
             if (device == currentDevice) currentDevice = null
         }
 
         override fun onCancel(device: UsbDevice) {
+            logEvent("キャンセルされました (権限拒否など)")
             if (device == currentDevice) currentDevice = null
+        }
+
+        override fun onError(device: UsbDevice, e: CameraException) {
+            val kind = when (e.code) {
+                CameraException.CAMERA_OPEN_ERROR_BUSY -> "デバイス占有"
+                CameraException.CAMERA_OPEN_ERROR_UNKNOWN -> "不明なエラー"
+                else -> "コード${e.code}"
+            }
+            logEvent("カメラ起動エラー: $kind (${e.message})")
+            if (device == currentDevice && !connected && openRetryStage < 3) {
+                openRetryStage++
+                handler.postDelayed({
+                    if (device == currentDevice && !connected) doOpenCamera(device)
+                }, 700)
+            } else if (!connected) {
+                runOnUiThread {
+                    binding.statusTip.text =
+                        "カメラを開けませんでした。抜き差しするか、下のボタンから選び直してください"
+                }
+            }
         }
     }
 
@@ -334,6 +472,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateConnectedUI() {
         binding.statusTip.visibility = if (connected) View.GONE else View.VISIBLE
         if (!connected) binding.deviceInfo.visibility = View.GONE
+        binding.btnDevices.visibility = if (connected) View.GONE else View.VISIBLE
         listOf(
             binding.btnPhoto, binding.btnFreeze, binding.btnControls,
             binding.btnRotate, binding.btnMirror, binding.btnResolution
@@ -345,6 +484,7 @@ class MainActivity : AppCompatActivity() {
     // ---------- ボタン類 ----------
 
     private fun setupButtons() {
+        binding.btnDevices.setOnClickListener { showDevicePicker() }
         binding.btnPhoto.setOnClickListener { takePicture() }
         binding.btnRecord.setOnClickListener {
             if (recording) stopRecording() else startRecording()

@@ -67,6 +67,18 @@
             android:textColor="#FFFFFF"
             android:textSize="14sp"
             android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/debugLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:background="#99000000"
+            android:fontFamily="monospace"
+            android:padding="6dp"
+            android:textColor="#B9F6CA"
+            android:textSize="10sp"
+            android:visibility="gone" />
     </FrameLayout>
 
     <LinearLayout
@@ -78,6 +90,13 @@
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent">
+
+        <Button
+            android:id="@+id/btnDevices"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_margin="6dp"
+            android:text="🔌 デバイスを選んで接続" />
 
         <ScrollView
             android:id="@+id/controlsPanel"
