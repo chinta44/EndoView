@@ -823,6 +823,9 @@ class MainActivity : AppCompatActivity() {
     private fun setupButtons() {
         binding.btnDevices.setOnClickListener { showDevicePicker() }
         binding.btnSaveDest.setOnClickListener { showSaveDestDialog() }
+        binding.btnGallery.setOnClickListener {
+            startActivity(Intent(this, GalleryActivity::class.java))
+        }
         binding.btnLogToggle.setOnClickListener {
             logVisible = !logVisible
             binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
