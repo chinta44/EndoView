@@ -19,6 +19,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.net.Uri
 import android.provider.MediaStore
 import android.util.Log
 import android.view.GestureDetector
@@ -92,6 +93,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var vendorSliders: List<VendorSlider> = emptyList()
+
+    // v0.3.0 仕上げ (録画 / ログ表示切替)
+    private var vendorRecorder: VendorRecorder? = null
+    private var pendingVideoUri: Uri? = null
+    private var logVisible = true
 
     private val handler = Handler(Looper.getMainLooper())
     private var recordStart = 0L
@@ -196,6 +202,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         title = "EndoView 内視鏡 v${appVersionName()}"
+        logVisible = getSharedPreferences("endoview", MODE_PRIVATE)
+            .getBoolean("log_visible", true)
+        binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
         logEvent("EndoView v${appVersionName()} を起動しました")
 
         setupPreviewSurface()
@@ -318,7 +327,7 @@ class MainActivity : AppCompatActivity() {
             while (logLines.size > 9) logLines.removeAt(0)
         }
         runOnUiThread {
-            binding.debugLog.visibility = View.VISIBLE
+            binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
             binding.debugLog.text = synchronized(logLines) { logLines.joinToString("\n") }
         }
     }
@@ -512,6 +521,7 @@ class MainActivity : AppCompatActivity() {
                 if (bmp != null) {
                     lastJpegBytes = jpeg
                     lastFrameBitmap = bmp
+                    vendorRecorder?.feed(bmp)
                     if (!frozen) {
                         runOnUiThread { binding.liveView.setImageBitmap(bmp) }
                     }
@@ -521,6 +531,7 @@ class MainActivity : AppCompatActivity() {
                 val bmp = yuvToBitmap(yuv)
                 if (bmp != null) {
                     lastFrameBitmap = bmp
+                    vendorRecorder?.feed(bmp)
                     if (!frozen) {
                         runOnUiThread { binding.liveView.setImageBitmap(bmp) }
                     }
@@ -761,7 +772,7 @@ class MainActivity : AppCompatActivity() {
             binding.btnPhoto, binding.btnFreeze, binding.btnControls,
             binding.btnRotate, binding.btnMirror, binding.btnResolution
         ).forEach { it.isEnabled = connected }
-        binding.btnRecord.isEnabled = connected && !vendorActive
+        binding.btnRecord.isEnabled = connected
         binding.btnResolution.isEnabled = connected && !vendorActive
         if (!connected) binding.controlsPanel.visibility = View.GONE
     }
@@ -770,6 +781,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupButtons() {
         binding.btnDevices.setOnClickListener { showDevicePicker() }
+        binding.btnLogToggle.setOnClickListener {
+            logVisible = !logVisible
+            binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
+            getSharedPreferences("endoview", MODE_PRIVATE).edit()
+                .putBoolean("log_visible", logVisible).apply()
+            toast(if (logVisible) "接続ログを表示します" else "接続ログを隠します")
+        }
         binding.btnPhoto.setOnClickListener { takePicture() }
         binding.btnRecord.setOnClickListener {
             if (recording) stopRecording() else startRecording()
@@ -999,7 +1017,84 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** ベンダー経路の録画開始 (H.264 / MP4、無音) */
+    private fun startVendorRecording() {
+        if (!connected || recording) return
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "ENDO_${timestamp()}.mp4")
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/EndoView")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        if (uri == null) {
+            toast("録画を開始できませんでした")
+            return
+        }
+        val pfd = try {
+            contentResolver.openFileDescriptor(uri, "w")
+        } catch (e: Exception) {
+            null
+        }
+        if (pfd == null) {
+            contentResolver.delete(uri, null, null)
+            toast("録画を開始できませんでした")
+            return
+        }
+        pendingVideoUri = uri
+        val rec = VendorRecorder { ok ->
+            runOnUiThread {
+                val doneUri = pendingVideoUri
+                pendingVideoUri = null
+                vendorRecorder = null
+                if (doneUri != null) {
+                    if (ok) {
+                        val done = ContentValues().apply {
+                            put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        }
+                        try {
+                            contentResolver.update(doneUri, done, null, null)
+                        } catch (e: Exception) {
+                            // 無視
+                        }
+                        toast("動画を保存しました (Movies/EndoView)")
+                    } else {
+                        try {
+                            contentResolver.delete(doneUri, null, null)
+                        } catch (e: Exception) {
+                            // 無視
+                        }
+                        toast("録画に失敗しました")
+                    }
+                }
+                finishRecordingUi()
+            }
+        }
+        if (rec.start(pfd)) {
+            vendorRecorder = rec
+            recording = true
+            binding.btnRecord.text = "⏹ 停止"
+            binding.recordTime.visibility = View.VISIBLE
+            recordStart = SystemClock.elapsedRealtime()
+            handler.post(recordTick)
+        } else {
+            pendingVideoUri = null
+            contentResolver.delete(uri, null, null)
+            toast("録画を開始できませんでした")
+        }
+    }
+
+    private fun stopVendorRecording() {
+        vendorRecorder?.stop()
+        // UI の後片付けは onFinished 側で行う。応答がない場合の保険
+        handler.postDelayed({ if (recording && vendorRecorder == null) finishRecordingUi() }, 4000)
+    }
+
     private fun startRecording() {
+        if (vendorActive) {
+            startVendorRecording()
+            return
+        }
         val helper = cameraHelper ?: return
         if (!connected || recording) return
         val values = ContentValues().apply {
@@ -1038,6 +1133,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopRecording() {
+        if (vendorActive) {
+            stopVendorRecording()
+            return
+        }
         cameraHelper?.stopRecording()
         // UI の後片付けは onVideoSaved 側でも行うが、押下時点で止まった見た目にする
         handler.postDelayed({ if (recording) finishRecordingUi() }, 600)

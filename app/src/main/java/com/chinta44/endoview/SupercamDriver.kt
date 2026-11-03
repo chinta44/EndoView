@@ -173,16 +173,16 @@ class SupercamDriver(
             tryIapHandshake(conn, eps)
             log("開始コマンド送信 (BB AA 05)")
             sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
-            if (probeMjpeg(conn, eps.videoIn, 5000)) {
+            if (probeMjpeg(conn, eps.videoIn, 2500)) {
                 startStreaming(conn, eps, "MJPEG")
                 return
             }
             if (totalReadBytes > 0) dumpRawHead("本命")
 
-            // 予備1: BB AA 05 を送り直す
+            // 予備1: BB AA 05 を送り直す (実機ではこちらで始まることが多い)
             log("予備1: BB AA 05 を再送")
             sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
-            if (probeMjpeg(conn, eps.videoIn, 3000)) {
+            if (probeMjpeg(conn, eps.videoIn, 4000)) {
                 startStreaming(conn, eps, "MJPEG")
                 return
             }
@@ -251,10 +251,10 @@ class SupercamDriver(
         try {
             conn.claimInterface(iapIface, true)
             val gbuf = ByteArray(512)
-            for (attempt in 1..4) {
+            for (attempt in 1..3) {
                 if (!running) return
                 val g = try {
-                    conn.bulkTransfer(iapIn, gbuf, gbuf.size, 1000)
+                    conn.bulkTransfer(iapIn, gbuf, gbuf.size, 800)
                 } catch (e: Exception) {
                     -1
                 }
