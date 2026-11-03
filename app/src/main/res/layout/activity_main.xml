@@ -20,6 +20,14 @@
             android:layout_height="match_parent"
             android:layout_gravity="center" />
 
+        <ImageView
+            android:id="@+id/liveView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="内視鏡映像 (独自プロトコル機)"
+            android:scaleType="fitCenter"
+            android:visibility="gone" />
+
         <com.chinta44.endoview.GridOverlayView
             android:id="@+id/gridOverlay"
             android:layout_width="match_parent"

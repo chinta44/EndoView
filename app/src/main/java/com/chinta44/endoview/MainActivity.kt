@@ -1,9 +1,16 @@
 package com.chinta44.endoview
 
 import android.Manifest
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -41,9 +48,11 @@ import com.serenegiant.usb.Size
 import com.serenegiant.usb.UVCControl
 import com.serenegiant.usb.UVCParam
 import com.serenegiant.usb.UVCCamera
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.thread
 
 /**
  * EndoView v0.1
@@ -66,6 +75,23 @@ class MainActivity : AppCompatActivity() {
     private var openRetryStage = 0
     private var launchIntentHandled = false
     private val logLines = mutableListOf<String>()
+
+    // v0.2.0 独自プロトコル機 (supercamera) 用
+    private var vendorDriver: SupercamDriver? = null
+    private var vendorActive = false
+    private var vendorPendingDevice: UsbDevice? = null
+    @Volatile
+    private var lastJpegBytes: ByteArray? = null
+    @Volatile
+    private var lastFrameBitmap: Bitmap? = null
+    private var mirrorState = 0 // 0:なし 1:左右 2:上下 3:両方 (ベンダー経路用)
+
+    private inner class VendorSlider(val label: String, val selector: Int) {
+        var seekBar: SeekBar? = null
+        var valueText: TextView? = null
+    }
+
+    private var vendorSliders: List<VendorSlider> = emptyList()
 
     private val handler = Handler(Looper.getMainLooper())
     private var recordStart = 0L
@@ -173,6 +199,16 @@ class MainActivity : AppCompatActivity() {
         setupPreviewSurface()
         setupZoomGestures()
         setupButtons()
+        registerUsbReceiver()
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(usbReceiver)
+        } catch (e: Exception) {
+            // 未登録でもよい
+        }
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -198,6 +234,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         super.onStop()
         if (recording) stopRecording()
+        stopVendorDriver()
         clearCameraHelper()
     }
 
@@ -258,6 +295,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun attachDevice(device: UsbDevice) {
+        if (SupercamDriver.isSupercam(device)) {
+            handleVendorAttach(device)
+            return
+        }
         if (currentDevice == null && !connected) {
             currentDevice = device
             logEvent("接続を開始します")
@@ -379,6 +420,207 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------- v0.2.0 独自プロトコル機 (supercamera) 経路 ----------
+
+    private val usbPermissionAction = "com.chinta44.endoview.USB_PERMISSION"
+
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                usbPermissionAction -> {
+                    val device = usbDeviceFromIntent(intent)
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    val pending = vendorPendingDevice
+                    vendorPendingDevice = null
+                    if (granted && pending != null) {
+                        logEvent("USB許可OK (ベンダー機)")
+                        startVendorDriver(pending)
+                    } else if (device != null || pending != null) {
+                        logEvent("USB許可が拒否されました")
+                        toast("USBの許可が必要です")
+                        if (currentDevice == pending) currentDevice = null
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val device = usbDeviceFromIntent(intent)
+                    if (device != null && vendorActive && device == currentDevice) {
+                        logEvent("ベンダー機が取り外されました")
+                        stopVendorDriver()
+                        currentDevice = null
+                    }
+                }
+            }
+        }
+    }
+
+    private fun registerUsbReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(usbPermissionAction)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        ContextCompat.registerReceiver(this, usbReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    private fun handleVendorAttach(device: UsbDevice) {
+        if (vendorActive || vendorPendingDevice != null) return
+        if (currentDevice != null && currentDevice != device && connected) return
+        currentDevice = device
+        logEvent("独自プロトコル機を検出 (supercamera系)。専用ドライバで接続します")
+        val usbManager = getSystemService(UsbManager::class.java) ?: return
+        if (usbManager.hasPermission(device)) {
+            startVendorDriver(device)
+        } else {
+            vendorPendingDevice = device
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                PendingIntent.FLAG_MUTABLE else 0
+            val pi = PendingIntent.getBroadcast(
+                this, 0, Intent(usbPermissionAction).setPackage(packageName), flags
+            )
+            usbManager.requestPermission(device, pi)
+            logEvent("USB許可を要求しました")
+        }
+    }
+
+    private fun startVendorDriver(device: UsbDevice) {
+        val usbManager = getSystemService(UsbManager::class.java) ?: return
+        vendorActive = true
+        binding.liveView.visibility = View.VISIBLE
+        val driver = SupercamDriver(
+            usbManager = usbManager,
+            log = { msg -> logEvent(msg) },
+            onStarted = {
+                runOnUiThread {
+                    connected = true
+                    updateConnectedUI()
+                    binding.deviceInfo.text = String.format(
+                        Locale.JAPAN, "%s (独自プロトコル)  VID:%04X PID:%04X  640×480",
+                        device.productName ?: device.deviceName, device.vendorId, device.productId
+                    )
+                    binding.deviceInfo.visibility = View.VISIBLE
+                    buildControls()
+                    toast("接続しました (640×480)")
+                }
+            },
+            onJpegFrame = { jpeg ->
+                val bmp = try {
+                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+                } catch (e: Exception) {
+                    null
+                }
+                if (bmp != null) {
+                    lastJpegBytes = jpeg
+                    lastFrameBitmap = bmp
+                    if (!frozen) {
+                        runOnUiThread { binding.liveView.setImageBitmap(bmp) }
+                    }
+                }
+            },
+            onButtonPress = {
+                runOnUiThread {
+                    logEvent("本体ボタンが押されました")
+                    takePicture()
+                }
+            },
+            onStopped = { reason ->
+                runOnUiThread {
+                    logEvent("ベンダー接続終了: $reason")
+                    if (vendorActive) {
+                        vendorActive = false
+                        connected = false
+                        binding.liveView.visibility = View.GONE
+                        updateConnectedUI()
+                    }
+                }
+            }
+        )
+        vendorDriver = driver
+        driver.start(device)
+    }
+
+    private fun stopVendorDriver() {
+        vendorDriver?.stop()
+        vendorDriver = null
+    }
+
+    private fun buildVendorControls() {
+        binding.slidersContainer.removeAllViews()
+        sliders = emptyList()
+        val defs = listOf(
+            VendorSlider("明るさ", SupercamDriver.PU_BRIGHTNESS),
+            VendorSlider("コントラスト", SupercamDriver.PU_CONTRAST),
+            VendorSlider("シャープネス", SupercamDriver.PU_SHARPNESS),
+            VendorSlider("ガンマ", SupercamDriver.PU_GAMMA)
+        )
+        for (def in defs) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 6, 0, 6)
+            }
+            val label = TextView(this).apply {
+                text = def.label
+                setTextColor(0xFFFFFFFF.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f)
+            }
+            val value = TextView(this).apply {
+                text = "50%"
+                setTextColor(0xFFFFD54F.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.6f)
+            }
+            val seek = SeekBar(this).apply {
+                max = 100
+                progress = 50
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2.2f)
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        def.valueText?.text = "$progress%"
+                        val raw = progress * 255 / 100
+                        val driver = vendorDriver
+                        thread { driver?.setPuValue(def.selector, raw) }
+                    }
+
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+            }
+            def.seekBar = seek
+            def.valueText = value
+            row.addView(label)
+            row.addView(seek)
+            row.addView(value)
+            binding.slidersContainer.addView(row)
+        }
+        vendorSliders = defs
+        // 現在値を読み取って表示に反映する
+        val driver = vendorDriver
+        thread {
+            for (def in defs) {
+                val raw = driver?.getPuValue(def.selector) ?: continue
+                val pct = (raw * 100 / 255).coerceIn(0, 100)
+                runOnUiThread {
+                    def.seekBar?.progress = pct
+                    def.valueText?.text = "$pct%"
+                }
+            }
+        }
+    }
+
+    private fun applyVendorPreset(preset: Map<String, Int>?) {
+        val driver = vendorDriver ?: return
+        thread {
+            for (def in vendorSliders) {
+                val pct = if (preset == null) 50 else (preset[def.label] ?: continue)
+                val raw = pct * 255 / 100
+                driver.setPuValue(def.selector, raw)
+                runOnUiThread {
+                    def.seekBar?.progress = pct
+                    def.valueText?.text = "$pct%"
+                }
+            }
+        }
+        toast(if (preset == null) "調整を標準に戻しました" else "プリセットを適用しました (対応項目のみ)")
+    }
+
     private val stateCallback = object : ICameraHelper.StateCallback {
         override fun onAttach(device: UsbDevice) {
             logEvent("検出: ${describeDevice(device)}")
@@ -429,6 +671,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onDetach(device: UsbDevice) {
             logEvent("取り外されました")
+            if (vendorActive && device == currentDevice) stopVendorDriver()
             if (device == currentDevice) currentDevice = null
         }
 
@@ -477,7 +720,8 @@ class MainActivity : AppCompatActivity() {
             binding.btnPhoto, binding.btnFreeze, binding.btnControls,
             binding.btnRotate, binding.btnMirror, binding.btnResolution
         ).forEach { it.isEnabled = connected }
-        binding.btnRecord.isEnabled = connected
+        binding.btnRecord.isEnabled = connected && !vendorActive
+        binding.btnResolution.isEnabled = connected && !vendorActive
         if (!connected) binding.controlsPanel.visibility = View.GONE
     }
 
@@ -514,6 +758,10 @@ class MainActivity : AppCompatActivity() {
         }
         binding.btnResetControls.setOnClickListener { applyPreset(null) }
         binding.btnExposureAuto.setOnClickListener {
+            if (vendorActive) {
+                toast("この内視鏡では露出の切替に未対応です")
+                return@setOnClickListener
+            }
             val control = cameraHelper?.uvcControl ?: return@setOnClickListener
             try {
                 control.setExposureTimeAuto(true)
@@ -536,6 +784,10 @@ class MainActivity : AppCompatActivity() {
     // ---------- 調整パネル ----------
 
     private fun buildControls() {
+        if (vendorActive) {
+            buildVendorControls()
+            return
+        }
         val control = cameraHelper?.uvcControl
         binding.slidersContainer.removeAllViews()
         sliders = emptyList()
@@ -603,6 +855,10 @@ class MainActivity : AppCompatActivity() {
 
     /** preset が null のときは全リセット。それ以外は指定した項目だけ％で適用する */
     private fun applyPreset(preset: Map<String, Int>?) {
+        if (vendorActive) {
+            applyVendorPreset(preset)
+            return
+        }
         val control = cameraHelper?.uvcControl ?: return
         try {
             if (preset == null) {
@@ -637,6 +893,10 @@ class MainActivity : AppCompatActivity() {
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.JAPAN).format(Date())
 
     private fun takePicture() {
+        if (vendorActive) {
+            takeVendorPicture()
+            return
+        }
         val helper = cameraHelper ?: return
         if (!connected || recording) return
         val values = ContentValues().apply {
@@ -656,6 +916,46 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread { toast("写真の保存に失敗: $message") }
             }
         })
+    }
+
+    /** ベンダー経路の写真: 最新 JPEG フレームを回転/反転を反映して保存する */
+    private fun takeVendorPicture() {
+        if (!connected || recording) return
+        val jpeg = lastJpegBytes
+        val bmp = lastFrameBitmap
+        if (jpeg == null || bmp == null) {
+            toast("映像がまだ来ていません")
+            return
+        }
+        thread {
+            val bytes = if (rotation == 0 && mirrorState == 0) {
+                jpeg
+            } else {
+                val matrix = Matrix()
+                val mx = if (mirrorState == 1 || mirrorState == 3) -1f else 1f
+                val my = if (mirrorState >= 2) -1f else 1f
+                matrix.setScale(mx, my)
+                if (rotation != 0) matrix.postRotate(rotation.toFloat())
+                val transformed = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                val out = ByteArrayOutputStream()
+                transformed.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                out.toByteArray()
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "ENDO_${timestamp()}.jpg")
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/EndoView")
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            var ok = false
+            if (uri != null) {
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ok = true
+            }
+            runOnUiThread {
+                toast(if (ok) "写真を保存しました (Pictures/EndoView)" else "写真の保存に失敗しました")
+            }
+        }
     }
 
     private fun startRecording() {
@@ -719,7 +1019,8 @@ class MainActivity : AppCompatActivity() {
             binding.btnFreeze.text = "❄ フリーズ"
             return
         }
-        val bmp = try { binding.preview.bitmap } catch (e: Exception) { null }
+        val bmp = if (vendorActive) lastFrameBitmap
+            else try { binding.preview.bitmap } catch (e: Exception) { null }
         if (bmp == null) {
             toast("映像がまだ来ていません")
             return
@@ -822,6 +1123,12 @@ class MainActivity : AppCompatActivity() {
     // ---------- 回転 / 反転 / 解像度 ----------
 
     private fun rotateBy90() {
+        if (vendorActive) {
+            rotation = (rotation + 90) % 360
+            applyVendorTransform()
+            toast("回転: ${rotation}°")
+            return
+        }
         val helper = cameraHelper ?: return
         rotation = (rotation + 90) % 360
         try {
@@ -833,6 +1140,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleMirror() {
+        if (vendorActive) {
+            mirrorState = (mirrorState + 1) % 4
+            applyVendorTransform()
+            toast(
+                when (mirrorState) {
+                    1 -> "左右反転"
+                    2 -> "上下反転"
+                    3 -> "上下左右反転"
+                    else -> "反転なし"
+                }
+            )
+            return
+        }
         val helper = cameraHelper ?: return
         mirrorMode = when (mirrorMode) {
             MirrorMode.MIRROR_NORMAL -> MirrorMode.MIRROR_HORIZONTAL
@@ -855,7 +1175,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** ベンダー経路プレビュー (liveView) への回転/反転の反映 */
+    private fun applyVendorTransform() {
+        binding.liveView.rotation = rotation.toFloat()
+        binding.liveView.scaleX = if (mirrorState == 1 || mirrorState == 3) -1f else 1f
+        binding.liveView.scaleY = if (mirrorState >= 2) -1f else 1f
+    }
+
     private fun showResolutionDialog() {
+        if (vendorActive) {
+            toast("この内視鏡は 640×480 固定です")
+            return
+        }
         val helper = cameraHelper ?: return
         val sizes = try {
             helper.supportedSizeList

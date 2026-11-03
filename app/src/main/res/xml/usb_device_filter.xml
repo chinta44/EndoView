@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Video class (0x0e) デバイス全般を対象にする。特定機種に絞らない汎用指定 -->
+<!-- Video class (0x0e) 全般 + 独自プロトコル機 supercamera (Geek szitman) -->
 <resources>
     <usb-device class="14" />
+    <usb-device vendor-id="11491" product-id="14376" />
+    <usb-device vendor-id="809" product-id="8226" />
 </resources>
