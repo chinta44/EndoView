@@ -154,38 +154,41 @@ class SupercamDriver(
                 log("setInterface失敗 (無視): ${e.message}")
             }
 
-            // 第1候補: iAP ハンドシェイク → BB AA 05 (実機で確認済みの本命)
-            if (tryIapHandshake(conn, eps)) {
-                sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
-                if (probe(conn, eps.videoIn, 4000)) {
-                    startStreaming(conn, eps)
-                    return
-                }
-            }
-
-            // 第2候補: ハンドシェイクなしで BB AA 05
-            log("方式2: BB AA 05 00 00 を送信 (ハンドシェイクなし)")
-            sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
-            if (probe(conn, eps.videoIn, 3000)) {
-                startStreaming(conn, eps)
-                return
-            }
-
-            // 第3候補: コントロール転送で開始 (YUYV 個体向け)
-            log("方式3: コントロール転送で開始を試行")
-            val infoBuf = ByteArray(512)
-            val infoN = try {
-                conn.controlTransfer(0xA0, 0x00, 0x0005, 0x0000, infoBuf, 512, 1000)
+            // 呼び水: デバイス情報の取得 (v0.2.1 成功時はこの後に挨拶が読めた)
+            val primeBuf = ByteArray(512)
+            val primeN = try {
+                conn.controlTransfer(0xA0, 0x00, 0x0005, 0x0000, primeBuf, 512, 1000)
             } catch (e: Exception) {
                 -1
             }
-            if (infoN > 0) {
-                val text = String(infoBuf, 0, infoN, Charsets.UTF_8)
+            if (primeN > 0) {
+                val text = String(primeBuf, 0, primeN, Charsets.UTF_8)
                     .replace(Regex("[\\x00-\\x1F]+"), " ").trim()
-                log("デバイス情報応答: ${text.take(80)}")
+                log("呼び水 (情報取得): ${text.take(60)}")
             } else {
-                log("デバイス情報応答なし ($infoN)")
+                log("呼び水 (情報取得): $primeN")
             }
+
+            // 本命: iAP ハンドシェイク → BB AA 05 → MJPEG
+            tryIapHandshake(conn, eps)
+            log("開始コマンド送信 (BB AA 05)")
+            sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
+            if (probeMjpeg(conn, eps.videoIn, 5000)) {
+                startStreaming(conn, eps, "MJPEG")
+                return
+            }
+            if (totalReadBytes > 0) dumpRawHead("本命")
+
+            // 予備1: BB AA 05 を送り直す
+            log("予備1: BB AA 05 を再送")
+            sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
+            if (probeMjpeg(conn, eps.videoIn, 3000)) {
+                startStreaming(conn, eps, "MJPEG")
+                return
+            }
+
+            // 予備2: コントロール転送で開始 (YUYV 個体向け)
+            log("予備2: コントロール転送で開始")
             val startData = ByteArray(64) { 0x30 }
             val startN = try {
                 conn.controlTransfer(0x20, 0x01, 0x0005, 0x0000, startData, 64, 1000)
@@ -193,9 +196,17 @@ class SupercamDriver(
                 -1
             }
             log("開始コントロール転送: $startN")
-            if (probe(conn, eps.videoIn, 4000)) {
-                startStreaming(conn, eps)
-                return
+            val beforeYuv = totalReadBytes
+            if (probeBytes(conn, eps.videoIn, 5000)) {
+                if (aabbSeen) {
+                    startStreaming(conn, eps, "MJPEG")
+                    return
+                }
+                if (totalReadBytes - beforeYuv >= FRAME_BYTES && !rawContainsAabb()) {
+                    startStreaming(conn, eps, "YUYV")
+                    return
+                }
+                dumpRawHead("予備2")
             }
 
             stopReason = "全方式で映像データを受信できませんでした (受信合計 $totalReadBytes バイト)"
@@ -227,34 +238,36 @@ class SupercamDriver(
         }
     }
 
-    /** iAP インターフェースの挨拶を読み、プローブを返す。成功で true */
-    private fun tryIapHandshake(conn: UsbDeviceConnection, eps: Endpoints): Boolean {
+    /** iAP インターフェースの挨拶読み取りとプローブ送信を数回試す */
+    private fun tryIapHandshake(conn: UsbDeviceConnection, eps: Endpoints) {
         val iapIn = eps.iapIn
         val iapOut = eps.iapOut
         val iapIface = eps.iapIface
         if (iapIn == null || iapOut == null || iapIface == null) {
             log("iAPインターフェースなし (スキップ)")
-            return false
+            return
         }
-        log("方式1: iAPハンドシェイク後に開始")
-        return try {
+        log("iAPハンドシェイク")
+        try {
             conn.claimInterface(iapIface, true)
             val gbuf = ByteArray(512)
-            val g1 = try {
-                conn.bulkTransfer(iapIn, gbuf, gbuf.size, 1200)
-            } catch (e: Exception) {
-                -1
+            for (attempt in 1..4) {
+                if (!running) return
+                val g = try {
+                    conn.bulkTransfer(iapIn, gbuf, gbuf.size, 1000)
+                } catch (e: Exception) {
+                    -1
+                }
+                log("iAP 読み取り #$attempt: $g ${if (g > 0) hexHead(gbuf, minOf(g, 8)) else ""}")
+                val pw = sendBulk(
+                    conn, iapOut,
+                    byteArrayOf(0xFF.toByte(), 0x55, 0xFF.toByte(), 0x55, 0xEE.toByte(), 0x10)
+                )
+                log("iAP プローブ送信 #$attempt: $pw")
+                if (pw > 0) return
             }
-            log("iAP 読み取り: $g1 ${if (g1 > 0) hexHead(gbuf, minOf(g1, 8)) else ""}")
-            val pw = sendBulk(
-                conn, iapOut,
-                byteArrayOf(0xFF.toByte(), 0x55, 0xFF.toByte(), 0x55, 0xEE.toByte(), 0x10)
-            )
-            log("iAP プローブ送信: $pw")
-            pw > 0
         } catch (e: Exception) {
             log("iAPハンドシェイク例外 (無視): ${e.message}")
-            false
         }
     }
 
@@ -351,8 +364,18 @@ class SupercamDriver(
         return n
     }
 
-    /** 指定時間データが来るか試す。1 バイトでも来たら true */
-    private fun probe(conn: UsbDeviceConnection, inEp: UsbEndpoint, durationMs: Long): Boolean {
+    /** AA BB パケットが来るまで指定時間試す */
+    private fun probeMjpeg(conn: UsbDeviceConnection, inEp: UsbEndpoint, durationMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + durationMs
+        while (running && SystemClock.elapsedRealtime() < deadline) {
+            readOnce(conn, inEp, 1200)
+            if (aabbSeen) return true
+        }
+        return aabbSeen
+    }
+
+    /** 何かデータが来るか指定時間試す */
+    private fun probeBytes(conn: UsbDeviceConnection, inEp: UsbEndpoint, durationMs: Long): Boolean {
         val deadline = SystemClock.elapsedRealtime() + durationMs
         val before = totalReadBytes
         while (running && SystemClock.elapsedRealtime() < deadline) {
@@ -362,12 +385,7 @@ class SupercamDriver(
         return totalReadBytes > before
     }
 
-    private fun startStreaming(conn: UsbDeviceConnection, eps: Endpoints) {
-        val format = when {
-            aabbSeen -> "MJPEG"
-            looksLikeYuv() -> "YUYV"
-            else -> "YUYV(推定)"
-        }
+    private fun startStreaming(conn: UsbDeviceConnection, eps: Endpoints, format: String) {
         log("ストリーミング開始: 形式 $format (受信 $totalReadBytes バイト)")
         onStarted()
         if (format == "MJPEG") {
@@ -381,10 +399,28 @@ class SupercamDriver(
         log("読み取り終了 (受信合計 $totalReadBytes バイト / 正常 $emittedFrames 枚 / 破棄 $droppedFrames 枚)")
     }
 
-    private fun looksLikeYuv(): Boolean {
+    private fun rawContainsAabb(): Boolean {
         val head = rawBuf.toByteArray()
-        if (head.size >= 2 && head[0] == 0xDD.toByte() && head[1] == 0xCC.toByte()) return true
-        return totalReadBytes > 0 && !aabbSeen
+        var i = 0
+        while (i + 1 < head.size) {
+            if (head[i] == 0xAA.toByte() && head[i + 1] == 0xBB.toByte()) return true
+            i++
+        }
+        return false
+    }
+
+    /** 形式不明データの切り分け用に先頭バイト列をログへ出す */
+    private fun dumpRawHead(tag: String) {
+        val head = rawBuf.toByteArray()
+        if (head.isEmpty()) return
+        val take = minOf(head.size, 48)
+        val hex = (0 until take).joinToString(" ") { String.format("%02X", head[it]) }
+        val ascii = (0 until take).joinToString("") {
+            val c = head[it].toInt() and 0xFF
+            if (c in 0x20..0x7E) c.toChar().toString() else "."
+        }
+        log("$tag 先頭データ: $hex")
+        log("$tag 先頭テキスト: $ascii")
     }
 
     private fun yuvLoop(conn: UsbDeviceConnection, inEp: UsbEndpoint) {

@@ -195,6 +195,8 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        title = "EndoView 内視鏡 v${appVersionName()}"
+        logEvent("EndoView v${appVersionName()} を起動しました")
 
         setupPreviewSurface()
         setupZoomGestures()
@@ -1254,6 +1256,15 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             .show()
+    }
+
+    private fun appVersionName(): String {
+        return try {
+            @Suppress("DEPRECATION")
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        } catch (e: Exception) {
+            "?"
+        }
     }
 
     private fun toast(msg: String) {
