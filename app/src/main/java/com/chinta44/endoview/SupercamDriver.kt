@@ -16,17 +16,18 @@ import kotlin.concurrent.thread
  * 独自プロトコルドライバ。この機種は UVC ではなくベンダー独自プロトコル
  * (com.useeplus.protocol) を使う。
  *
- * ファームウェア違いで開始手順が異なる個体があるため、接続時に段階的に試す:
- *  方式A: 映像IFへ BB AA 05 00 00 → AA BB ヘッダ付きパケットで JPEG 配信 (MJPEG)
- *  方式B: コントロール転送2回 (情報取得 + 開始) → YUYV422 生フレーム配信
- *  方式C: iAP インターフェースの MFi プローブ (読み→書き→読み) の後に方式A
- * データが流れた方式でそのままストリーミングを続ける。
+ * 確立した接続手順 (実機で確認済み):
+ *  1. iAP インターフェースの IN から挨拶 FF 55 02 00 EE 10 を読み取る
+ *  2. iAP の OUT へプローブ FF 55 FF 55 EE 10 を送る
+ *  3. 映像インターフェース (protocol=1) の OUT へ BB AA 05 00 00 を送ると
+ *     944 バイトパケット (12 バイトヘッダ AA BB + JPEG データ) の配信が始まる
+ * 個体差に備え、失敗した場合は「プローブなしの BB AA 05」「コントロール転送
+ * (YUYV 生フレーム)」の順にフォールバックする。
  *
- * MJPEG 形式: IN パケットは 12 バイトヘッダ (AA BB / CID / 長さLE / フレームID /
- * フラグ) + JPEG データ。ヘッダを除いて連結し FF D8..FF D9 で切り出す。
+ * フレーム組み立てはヘッダのフレーム ID (byte[5]) 単位で行い、先頭 SOI と
+ * 末尾 EOI が揃ったフレームだけを渡す。不完全なフレームは表示せず捨てる
+ * (砂嵐・フラッシュ防止)。
  * ヘッダのフラグ byte[7] bit1 は本体の物理ボタン。
- * YUYV 形式: 1 フレーム = 614400 バイト (640x480x2)。間に 511 バイトの
- * DD CC 始まりステータスパケットが挟まることがある。
  * 画質調整は UVC Processing Unit 形式のコントロール転送
  * (明るさ/コントラスト/シャープネス/ガンマ)。
  */
@@ -44,14 +45,17 @@ class SupercamDriver(
     private var connection: UsbDeviceConnection? = null
     private var worker: Thread? = null
 
-    // ストリーム解析用の状態 (方式判定プローブと本読み取りで共有する)
+    // ストリーム解析用の状態
     private val streamBuf = ByteArrayOutputStream()
-    private val frameBuf = ByteArrayOutputStream()
     private val rawBuf = ByteArrayOutputStream()
+    private val currentFrame = ByteArrayOutputStream()
+    private var currentFrameId = -1
     private var aabbSeen = false
     private var prevButtonBit = 0
     private var totalReadBytes = 0L
     private var readCount = 0
+    private var droppedFrames = 0
+    private var emittedFrames = 0
 
     companion object {
         private const val TAG = "SupercamDriver"
@@ -122,6 +126,8 @@ class SupercamDriver(
         val iapOut: UsbEndpoint?
     )
 
+    private var lastVideoOut: UsbEndpoint? = null
+
     private fun runSession(device: UsbDevice) {
         var conn: UsbDeviceConnection? = null
         var stopReason = "切断されました"
@@ -148,16 +154,25 @@ class SupercamDriver(
                 log("setInterface失敗 (無視): ${e.message}")
             }
 
-            // 方式A: BB AA 05 で開始 → MJPEG
-            log("方式A: BB AA 05 00 00 を送信")
+            // 第1候補: iAP ハンドシェイク → BB AA 05 (実機で確認済みの本命)
+            if (tryIapHandshake(conn, eps)) {
+                sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
+                if (probe(conn, eps.videoIn, 4000)) {
+                    startStreaming(conn, eps)
+                    return
+                }
+            }
+
+            // 第2候補: ハンドシェイクなしで BB AA 05
+            log("方式2: BB AA 05 00 00 を送信 (ハンドシェイクなし)")
             sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
-            if (probe(conn, eps.videoIn, 4500)) {
+            if (probe(conn, eps.videoIn, 3000)) {
                 startStreaming(conn, eps)
                 return
             }
 
-            // 方式B: コントロール転送で開始 → YUYV (または MJPEG)
-            log("方式B: コントロール転送で開始を試行")
+            // 第3候補: コントロール転送で開始 (YUYV 個体向け)
+            log("方式3: コントロール転送で開始を試行")
             val infoBuf = ByteArray(512)
             val infoN = try {
                 conn.controlTransfer(0xA0, 0x00, 0x0005, 0x0000, infoBuf, 512, 1000)
@@ -178,45 +193,9 @@ class SupercamDriver(
                 -1
             }
             log("開始コントロール転送: $startN")
-            if (probe(conn, eps.videoIn, 4500)) {
+            if (probe(conn, eps.videoIn, 4000)) {
                 startStreaming(conn, eps)
                 return
-            }
-
-            // 方式C: iAP プローブ (読み→書き→読み) の後に方式Aを再試行
-            val iapIn = eps.iapIn
-            val iapOut = eps.iapOut
-            val iapIface = eps.iapIface
-            if (iapIn != null && iapOut != null && iapIface != null) {
-                log("方式C: iAPプローブ後に再試行")
-                try {
-                    conn.claimInterface(iapIface, true)
-                    val gbuf = ByteArray(512)
-                    val g1 = try {
-                        conn.bulkTransfer(iapIn, gbuf, gbuf.size, 800)
-                    } catch (e: Exception) {
-                        -1
-                    }
-                    log("iAP 読み取り(前): $g1 ${if (g1 > 0) hexHead(gbuf, minOf(g1, 8)) else ""}")
-                    val pw = sendBulk(
-                        conn, iapOut,
-                        byteArrayOf(0xFF.toByte(), 0x55, 0xFF.toByte(), 0x55, 0xEE.toByte(), 0x10)
-                    )
-                    log("iAP プローブ送信: $pw")
-                    val g2 = try {
-                        conn.bulkTransfer(iapIn, gbuf, gbuf.size, 800)
-                    } catch (e: Exception) {
-                        -1
-                    }
-                    log("iAP 読み取り(後): $g2 ${if (g2 > 0) hexHead(gbuf, minOf(g2, 8)) else ""}")
-                } catch (e: Exception) {
-                    log("iAPプローブ例外 (無視): ${e.message}")
-                }
-                sendBulk(conn, eps.videoOut, byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x05, 0x00, 0x00))
-                if (probe(conn, eps.videoIn, 4500)) {
-                    startStreaming(conn, eps)
-                    return
-                }
             }
 
             stopReason = "全方式で映像データを受信できませんでした (受信合計 $totalReadBytes バイト)"
@@ -227,14 +206,12 @@ class SupercamDriver(
         } finally {
             try {
                 val c = conn
-                if (c != null) {
-                    val outEp = lastVideoOut
-                    if (outEp != null) {
-                        c.bulkTransfer(
-                            outEp,
-                            byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x08, 0x00, 0x00), 5, 500
-                        )
-                    }
+                val outEp = lastVideoOut
+                if (c != null && outEp != null) {
+                    c.bulkTransfer(
+                        outEp,
+                        byteArrayOf(0xBB.toByte(), 0xAA.toByte(), 0x08, 0x00, 0x00), 5, 500
+                    )
                 }
             } catch (e: Exception) {
                 // 片付け中の失敗は無視
@@ -250,7 +227,36 @@ class SupercamDriver(
         }
     }
 
-    private var lastVideoOut: UsbEndpoint? = null
+    /** iAP インターフェースの挨拶を読み、プローブを返す。成功で true */
+    private fun tryIapHandshake(conn: UsbDeviceConnection, eps: Endpoints): Boolean {
+        val iapIn = eps.iapIn
+        val iapOut = eps.iapOut
+        val iapIface = eps.iapIface
+        if (iapIn == null || iapOut == null || iapIface == null) {
+            log("iAPインターフェースなし (スキップ)")
+            return false
+        }
+        log("方式1: iAPハンドシェイク後に開始")
+        return try {
+            conn.claimInterface(iapIface, true)
+            val gbuf = ByteArray(512)
+            val g1 = try {
+                conn.bulkTransfer(iapIn, gbuf, gbuf.size, 1200)
+            } catch (e: Exception) {
+                -1
+            }
+            log("iAP 読み取り: $g1 ${if (g1 > 0) hexHead(gbuf, minOf(g1, 8)) else ""}")
+            val pw = sendBulk(
+                conn, iapOut,
+                byteArrayOf(0xFF.toByte(), 0x55, 0xFF.toByte(), 0x55, 0xEE.toByte(), 0x10)
+            )
+            log("iAP プローブ送信: $pw")
+            pw > 0
+        } catch (e: Exception) {
+            log("iAPハンドシェイク例外 (無視): ${e.message}")
+            false
+        }
+    }
 
     private fun discoverEndpoints(device: UsbDevice): Endpoints? {
         var videoIface: UsbInterface? = null
@@ -319,9 +325,6 @@ class SupercamDriver(
 
     // ---------- データ受信と解析 ----------
 
-    /**
-     * 1 回読み取り、解析バッファへ流す。戻り値は読み取ったバイト数 (-1 はタイムアウト等)。
-     */
     private fun readOnce(conn: UsbDeviceConnection, inEp: UsbEndpoint, timeoutMs: Int): Int {
         val buf = ByteArray(17408)
         val n = try {
@@ -332,7 +335,7 @@ class SupercamDriver(
         readCount++
         if (n > 0) {
             totalReadBytes += n
-            if (readCount <= 10) {
+            if (readCount <= 6) {
                 log("受信 #$readCount: $n バイト 先頭 ${hexHead(buf, minOf(n, 8))}")
             } else {
                 Log.d(TAG, "read #$readCount: $n bytes")
@@ -342,8 +345,7 @@ class SupercamDriver(
             }
             streamBuf.write(buf, 0, n)
             parsePackets()
-            carveJpegs()
-        } else if (readCount <= 10) {
+        } else if (readCount <= 6) {
             log("受信 #$readCount: $n (データなし)")
         }
         return n
@@ -360,7 +362,6 @@ class SupercamDriver(
         return totalReadBytes > before
     }
 
-    /** 流れた方式で本ストリーミングに入る */
     private fun startStreaming(conn: UsbDeviceConnection, eps: Endpoints) {
         val format = when {
             aabbSeen -> "MJPEG"
@@ -377,23 +378,20 @@ class SupercamDriver(
         } else {
             yuvLoop(conn, eps.videoIn)
         }
-        log("読み取り終了 (受信合計 $totalReadBytes バイト)")
+        log("読み取り終了 (受信合計 $totalReadBytes バイト / 正常 $emittedFrames 枚 / 破棄 $droppedFrames 枚)")
     }
 
     private fun looksLikeYuv(): Boolean {
         val head = rawBuf.toByteArray()
         if (head.size >= 2 && head[0] == 0xDD.toByte() && head[1] == 0xCC.toByte()) return true
-        // ステータスパケットを除いた実データが十分ある場合は YUYV とみなす
         return totalReadBytes > 0 && !aabbSeen
     }
 
     private fun yuvLoop(conn: UsbDeviceConnection, inEp: UsbEndpoint) {
-        // rawBuf の蓄積分から開始する
         val acc = ByteArrayOutputStream()
         acc.write(rawBuf.toByteArray())
         val chunk = ByteArray(65536)
         while (running) {
-            // フレーム境界処理: 先頭が DD CC なら 511 バイト捨てる
             var data = acc.toByteArray()
             var consumed = 0
             while (data.size - consumed >= 2 &&
@@ -409,7 +407,7 @@ class SupercamDriver(
             }
             acc.reset()
             if (consumed < data.size) acc.write(data, consumed, data.size - consumed)
-            if (acc.size() >= FRAME_BYTES + 511) continue // まだ処理できる
+            if (acc.size() >= FRAME_BYTES + 511) continue
 
             val n = try {
                 conn.bulkTransfer(inEp, chunk, chunk.size, 5000)
@@ -424,6 +422,8 @@ class SupercamDriver(
             }
         }
     }
+
+    // ---------- MJPEG パケット解析 (フレーム ID 単位で組み立て) ----------
 
     private fun parsePackets() {
         val data = streamBuf.toByteArray()
@@ -459,7 +459,19 @@ class SupercamDriver(
                     onButtonPress()
                 }
                 prevButtonBit = bit
-                frameBuf.write(data, idx + 12, total - 12)
+                val fid = data[idx + 5].toInt() and 0xFF
+                if (currentFrameId == -1) {
+                    currentFrameId = fid
+                } else if (fid != currentFrameId) {
+                    finalizeFrame()
+                    currentFrameId = fid
+                }
+                currentFrame.write(data, idx + 12, total - 12)
+                if (currentFrame.size() > 262144) {
+                    // 異常に大きい = 組み立て異常。捨てて立て直す
+                    currentFrame.reset()
+                    droppedFrames++
+                }
             }
             pos = idx + total
             keepFrom = pos
@@ -470,30 +482,26 @@ class SupercamDriver(
         }
     }
 
-    private fun carveJpegs() {
-        var fb = frameBuf.toByteArray()
-        while (true) {
-            val soi = indexOfMarker(fb, 0, 0xD8)
-            if (soi < 0) {
-                if (fb.size > 65536) frameBuf.reset()
-                return
-            }
-            val eoi = indexOfMarker(fb, soi + 2, 0xD9)
-            if (eoi < 0) {
-                if (soi > 0) {
-                    frameBuf.reset()
-                    frameBuf.write(fb, soi, fb.size - soi)
-                }
-                if (fb.size > 1_000_000) frameBuf.reset()
-                return
-            }
-            val jpeg = fb.copyOfRange(soi, eoi + 2)
-            onJpegFrame(jpeg)
-            val rest = fb.size - (eoi + 2)
-            frameBuf.reset()
-            if (rest > 0) frameBuf.write(fb, eoi + 2, rest)
-            fb = frameBuf.toByteArray()
+    /** 1 フレーム分が揃ったら検証して渡す。欠けていれば表示せず捨てる */
+    private fun finalizeFrame() {
+        val fb = currentFrame.toByteArray()
+        currentFrame.reset()
+        if (fb.size < 4) return
+        val soi = indexOfMarker(fb, 0, 0xD8)
+        if (soi < 0) {
+            droppedFrames++
+            return
         }
+        val eoi = indexOfMarker(fb, soi + 2, 0xD9)
+        if (eoi < 0) {
+            droppedFrames++
+            if (droppedFrames <= 3) {
+                log("不完全なフレームを破棄 (${fb.size} バイト)")
+            }
+            return
+        }
+        emittedFrames++
+        onJpegFrame(fb.copyOfRange(soi, eoi + 2))
     }
 
     private fun indexOfHeader(data: ByteArray, from: Int): Int {
