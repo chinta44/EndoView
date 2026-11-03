@@ -515,6 +515,15 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             },
+            onYuvFrame = { yuv ->
+                val bmp = yuvToBitmap(yuv)
+                if (bmp != null) {
+                    lastFrameBitmap = bmp
+                    if (!frozen) {
+                        runOnUiThread { binding.liveView.setImageBitmap(bmp) }
+                    }
+                }
+            },
             onButtonPress = {
                 runOnUiThread {
                     logEvent("本体ボタンが押されました")
@@ -535,6 +544,36 @@ class MainActivity : AppCompatActivity() {
         )
         vendorDriver = driver
         driver.start(device)
+    }
+
+    /** YUYV422 (640x480) の生フレームを Bitmap に変換する */
+    private fun yuvToBitmap(yuv: ByteArray): Bitmap? {
+        val width = 640
+        val height = 480
+        if (yuv.size < width * height * 2) return null
+        val pixels = IntArray(width * height)
+        var i = 0
+        var p = 0
+        while (i + 3 < yuv.size && p < pixels.size - 1) {
+            val y0 = yuv[i].toInt() and 0xFF
+            val u = (yuv[i + 1].toInt() and 0xFF) - 128
+            val y1 = yuv[i + 2].toInt() and 0xFF
+            val v = (yuv[i + 3].toInt() and 0xFF) - 128
+            pixels[p] = yuvPixel(y0, u, v)
+            pixels[p + 1] = yuvPixel(y1, u, v)
+            i += 4
+            p += 2
+        }
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(pixels, 0, width, 0, 0, width, height)
+        return bmp
+    }
+
+    private fun yuvPixel(y: Int, u: Int, v: Int): Int {
+        val r = (y + ((359 * v) shr 8)).coerceIn(0, 255)
+        val g = (y - ((88 * u + 183 * v) shr 8)).coerceIn(0, 255)
+        val b = (y + ((454 * u) shr 8)).coerceIn(0, 255)
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
     }
 
     private fun stopVendorDriver() {
@@ -923,12 +962,12 @@ class MainActivity : AppCompatActivity() {
         if (!connected || recording) return
         val jpeg = lastJpegBytes
         val bmp = lastFrameBitmap
-        if (jpeg == null || bmp == null) {
+        if (bmp == null) {
             toast("映像がまだ来ていません")
             return
         }
         thread {
-            val bytes = if (rotation == 0 && mirrorState == 0) {
+            val bytes = if (rotation == 0 && mirrorState == 0 && jpeg != null) {
                 jpeg
             } else {
                 val matrix = Matrix()
