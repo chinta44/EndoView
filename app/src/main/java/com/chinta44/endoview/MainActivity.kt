@@ -110,6 +110,13 @@ class MainActivity : AppCompatActivity() {
     private val idleHandler = Handler(Looper.getMainLooper())
     private var controlsHidden = false
     private val hideControlsRunnable = Runnable { hideControls() }
+
+    // v0.5.1: 画面回転やギャラリー表示で接続が切れないよう、切断は遅延実行する
+    private val teardownRunnable = Runnable {
+        if (recording) stopRecording()
+        stopVendorDriver()
+        clearCameraHelper()
+    }
     private val folderPicker = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
@@ -262,6 +269,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        handler.removeCallbacks(teardownRunnable)
         initCameraHelper()
         // USB接続インテントで起動された場合、そのデバイスを拾う (初回のみ)
         if (!launchIntentHandled) {
@@ -271,15 +279,38 @@ class MainActivity : AppCompatActivity() {
                 attachDevice(it)
             }
         }
+        tryAutoReconnect()
     }
 
     override fun onStop() {
         super.onStop()
         idleHandler.removeCallbacks(hideControlsRunnable)
         if (controlsHidden) showControls()
-        if (recording) stopRecording()
-        stopVendorDriver()
-        clearCameraHelper()
+        // 画面回転などで Activity が作り直される場合は即切断し、新しい画面側の
+        // 自動再接続に任せる。ギャラリー表示などの一時的な背景化ではすぐには
+        // 切らず、60 秒戻らなければ切断する
+        if (isChangingConfigurations) {
+            if (recording) stopRecording()
+            stopVendorDriver()
+            clearCameraHelper()
+        } else {
+            handler.postDelayed(teardownRunnable, 60_000)
+        }
+    }
+
+    /** つながっている内視鏡があれば自動で (再) 接続する */
+    private fun tryAutoReconnect() {
+        if (connected || vendorActive || vendorPendingDevice != null) return
+        val usbManager = getSystemService(UsbManager::class.java) ?: return
+        val devices = usbManager.deviceList?.values.orEmpty()
+        val target = devices.firstOrNull { SupercamDriver.isSupercam(it) }
+            ?: currentDevice?.let { prev ->
+                devices.firstOrNull { it.deviceName == prev.deviceName }
+            }
+        if (target != null) {
+            logEvent("自動で再接続します")
+            attachDevice(target)
+        }
     }
 
     // ---------- カメラ初期化 ----------
@@ -490,6 +521,13 @@ class MainActivity : AppCompatActivity() {
                         if (currentDevice == pending) currentDevice = null
                     }
                 }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    // ケーブルの瞬断などで再接続されたときも拾う (対象機種のみ)
+                    val device = usbDeviceFromIntent(intent)
+                    if (device != null && SupercamDriver.isSupercam(device)) {
+                        attachDevice(device)
+                    }
+                }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val device = usbDeviceFromIntent(intent)
                     if (device != null && vendorActive && device == currentDevice) {
@@ -505,6 +543,7 @@ class MainActivity : AppCompatActivity() {
     private fun registerUsbReceiver() {
         val filter = IntentFilter().apply {
             addAction(usbPermissionAction)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         ContextCompat.registerReceiver(this, usbReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
