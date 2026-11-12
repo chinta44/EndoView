@@ -114,6 +114,7 @@ class MainActivity : AppCompatActivity() {
     private val prefs by lazy { getSharedPreferences("endoview", MODE_PRIVATE) }
     private val idleHandler = Handler(Looper.getMainLooper())
     private var controlsHidden = false
+    private var controlsLocked = false // v0.5.3: true の間は操作ボタンを自動で隠さない
     private val hideControlsRunnable = Runnable { hideControls() }
 
     // v0.5.1: 画面回転やギャラリー表示で接続が切れないよう、切断は遅延実行する
@@ -247,6 +248,7 @@ class MainActivity : AppCompatActivity() {
         WindowInsetsControllerCompat(window, binding.root).systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         logVisible = prefs.getBoolean("log_visible", true)
+        controlsLocked = prefs.getBoolean("controls_locked", false)
         binding.debugLog.visibility = if (logVisible) View.VISIBLE else View.GONE
         logEvent("EndoView v${appVersionName()} を起動しました")
 
@@ -254,6 +256,7 @@ class MainActivity : AppCompatActivity() {
         setupZoomGestures()
         setupButtons()
         registerUsbReceiver()
+        updateLockButton()
         checkForUpdate()
     }
 
@@ -900,6 +903,19 @@ class MainActivity : AppCompatActivity() {
                 if (binding.gridOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
         binding.btnResolution.setOnClickListener { showResolutionDialog() }
+        binding.btnLock.setOnClickListener {
+            controlsLocked = !controlsLocked
+            prefs.edit().putBoolean("controls_locked", controlsLocked).apply()
+            updateLockButton()
+            if (controlsLocked) {
+                idleHandler.removeCallbacks(hideControlsRunnable)
+                if (controlsHidden) showControls()
+                toast("ボタンを隠さないようにしました")
+            } else {
+                scheduleControlsHide()
+                toast("ボタンは自動で隠れるようになります")
+            }
+        }
 
         binding.presetDefault.setOnClickListener { applyPreset(null) }
         binding.presetDark.setOnClickListener {
@@ -1134,10 +1150,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun scheduleControlsHide() {
         idleHandler.removeCallbacks(hideControlsRunnable)
+        if (controlsLocked) return
         idleHandler.postDelayed(hideControlsRunnable, 3500)
     }
 
     private fun hideControls() {
+        if (controlsLocked) return
         if (!connected || recording || frozen) return
         if (binding.controlsPanel.visibility == View.VISIBLE) return
         controlsHidden = true
@@ -1158,6 +1176,13 @@ class MainActivity : AppCompatActivity() {
         }
         WindowInsetsControllerCompat(window, binding.root)
             .show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    private fun updateLockButton() {
+        binding.btnLock.setImageResource(
+            if (controlsLocked) R.drawable.ic_lock else R.drawable.ic_lock_open
+        )
+        binding.btnLock.alpha = if (controlsLocked) 1f else 0.75f
     }
 
     /** UVC プレビューを画面いっぱいに表示する (はみ出し分は切り取る) */

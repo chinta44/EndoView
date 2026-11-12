@@ -188,11 +188,21 @@
             android:id="@+id/btnControls"
             android:layout_width="48dp"
             android:layout_height="48dp"
+            android:layout_marginBottom="10dp"
             android:background="@drawable/bg_circle_btn"
             android:contentDescription="調整"
             android:enabled="false"
             android:padding="12dp"
             android:src="@drawable/ic_tune" />
+
+        <ImageButton
+            android:id="@+id/btnLock"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="@drawable/bg_circle_btn"
+            android:contentDescription="ボタンの自動非表示ロック"
+            android:padding="12dp"
+            android:src="@drawable/ic_lock_open" />
     </LinearLayout>
 
     <LinearLayout
