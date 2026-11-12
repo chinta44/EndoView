@@ -11,8 +11,8 @@ android {
         applicationId = "com.chinta44.endoview"
         minSdk = 29
         targetSdk = 34
-        versionCode = 11
-        versionName = "0.5.1"
+        versionCode = 12
+        versionName = "0.5.2"
 
         // 内視鏡は arm 系のみで十分。ライブラリ同梱の so に合わせる
         ndk {

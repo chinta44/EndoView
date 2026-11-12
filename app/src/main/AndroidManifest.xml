@@ -2,10 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- 実際に使うのは CAMERA のみ (Android 9+ で UVC カメラ接続に必要) -->
+    <!-- CAMERA: UVC カメラ接続に必要 (Android 9+) / INTERNET: 更新チェック専用 (v0.5.2) -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- ライブラリ同梱の権限は使わないので打ち消す (位置情報・ネット・マイク・ストレージ全権なし) -->
+    <!-- ライブラリ同梱の権限は使わないので打ち消す (位置情報・マイク・ストレージ全権なし) -->
     <uses-permission
         android:name="android.permission.RECORD_AUDIO"
         tools:node="remove" />

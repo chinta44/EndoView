@@ -56,6 +56,8 @@ import com.serenegiant.usb.UVCControl
 import com.serenegiant.usb.UVCParam
 import com.serenegiant.usb.UVCCamera
 import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -84,13 +86,16 @@ class MainActivity : AppCompatActivity() {
     private val logLines = mutableListOf<String>()
 
     // v0.2.0 独自プロトコル機 (supercamera) 用
-    private var vendorDriver: SupercamDriver? = null
-    private var vendorActive = false
+    // v0.5.2: 接続の実体は VendorSession (アプリ全体) が保持し、画面は借りるだけ
+    private val vendorDriver: SupercamDriver?
+        get() = VendorSession.driver
+    private val vendorActive: Boolean
+        get() = VendorSession.active
     private var vendorPendingDevice: UsbDevice? = null
-    @Volatile
-    private var lastJpegBytes: ByteArray? = null
-    @Volatile
-    private var lastFrameBitmap: Bitmap? = null
+    private val lastJpegBytes: ByteArray?
+        get() = VendorSession.lastJpegBytes
+    private val lastFrameBitmap: Bitmap?
+        get() = VendorSession.lastFrameBitmap
     private var mirrorState = 0 // 0:なし 1:左右 2:上下 3:両方 (ベンダー経路用)
 
     private inner class VendorSlider(val label: String, val selector: Int) {
@@ -249,6 +254,7 @@ class MainActivity : AppCompatActivity() {
         setupZoomGestures()
         setupButtons()
         registerUsbReceiver()
+        checkForUpdate()
     }
 
     override fun onDestroy() {
@@ -279,6 +285,23 @@ class MainActivity : AppCompatActivity() {
                 attachDevice(it)
             }
         }
+        // v0.5.2: ベンダー接続が生きていれば、この画面が引き継ぐ (回転対策)
+        VendorSession.listener = vendorListener
+        if (VendorSession.streaming) {
+            binding.liveView.visibility = View.VISIBLE
+            connected = true
+            currentDevice = VendorSession.device
+            VendorSession.device?.let { device ->
+                binding.deviceInfo.text = String.format(
+                    Locale.JAPAN, "%s (独自プロトコル)  VID:%04X PID:%04X  640×480",
+                    device.productName ?: device.deviceName, device.vendorId, device.productId
+                )
+            }
+            binding.deviceInfo.visibility = View.VISIBLE
+            VendorSession.lastFrameBitmap?.let { binding.liveView.setImageBitmap(it) }
+            buildControls()
+            updateConnectedUI()
+        }
         tryAutoReconnect()
     }
 
@@ -286,14 +309,16 @@ class MainActivity : AppCompatActivity() {
         super.onStop()
         idleHandler.removeCallbacks(hideControlsRunnable)
         if (controlsHidden) showControls()
-        // 画面回転などで Activity が作り直される場合は即切断し、新しい画面側の
-        // 自動再接続に任せる。ギャラリー表示などの一時的な背景化ではすぐには
-        // 切らず、60 秒戻らなければ切断する
+        if (VendorSession.listener === vendorListener) VendorSession.listener = null
         if (isChangingConfigurations) {
+            // 画面の作り直し (回転など): ベンダー接続は VendorSession が
+            // 保持するので切らない。録画中なら区切って保存し、UVC 経路だけは
+            // 画面に紐づくため切り離す (再接続は onStart で自動)
             if (recording) stopRecording()
-            stopVendorDriver()
             clearCameraHelper()
         } else {
+            // ギャラリー表示などの一時的な背景化ではすぐには切らず、
+            // 60 秒戻らなければ切断する
             handler.postDelayed(teardownRunnable, 60_000)
         }
     }
@@ -569,71 +594,55 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startVendorDriver(device: UsbDevice) {
-        val usbManager = getSystemService(UsbManager::class.java) ?: return
-        vendorActive = true
-        binding.liveView.visibility = View.VISIBLE
-        val driver = SupercamDriver(
-            usbManager = usbManager,
-            log = { msg -> logEvent(msg) },
-            onStarted = {
-                runOnUiThread {
-                    connected = true
-                    updateConnectedUI()
+    /** VendorSession からの通知を受ける画面側の受け口 */
+    private val vendorListener = object : VendorSession.Listener {
+        override fun onLog(msg: String) = logEvent(msg)
+
+        override fun onStreamingStarted() {
+            runOnUiThread {
+                connected = true
+                updateConnectedUI()
+                VendorSession.device?.let { device ->
                     binding.deviceInfo.text = String.format(
                         Locale.JAPAN, "%s (独自プロトコル)  VID:%04X PID:%04X  640×480",
                         device.productName ?: device.deviceName, device.vendorId, device.productId
                     )
-                    binding.deviceInfo.visibility = View.VISIBLE
-                    buildControls()
-                    toast("接続しました (640×480)")
                 }
-            },
-            onJpegFrame = { jpeg ->
-                val bmp = try {
-                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
-                } catch (e: Exception) {
-                    null
-                }
-                if (bmp != null) {
-                    lastJpegBytes = jpeg
-                    lastFrameBitmap = bmp
-                    vendorRecorder?.feed(bmp)
-                    if (!frozen) {
-                        runOnUiThread { binding.liveView.setImageBitmap(bmp) }
-                    }
-                }
-            },
-            onYuvFrame = { yuv ->
-                val bmp = yuvToBitmap(yuv)
-                if (bmp != null) {
-                    lastFrameBitmap = bmp
-                    vendorRecorder?.feed(bmp)
-                    if (!frozen) {
-                        runOnUiThread { binding.liveView.setImageBitmap(bmp) }
-                    }
-                }
-            },
-            onButtonPress = {
-                runOnUiThread {
-                    logEvent("本体ボタンが押されました")
-                    takePicture()
-                }
-            },
-            onStopped = { reason ->
-                runOnUiThread {
-                    logEvent("ベンダー接続終了: $reason")
-                    if (vendorActive) {
-                        vendorActive = false
-                        connected = false
-                        binding.liveView.visibility = View.GONE
-                        updateConnectedUI()
-                    }
-                }
+                binding.deviceInfo.visibility = View.VISIBLE
+                buildControls()
+                toast("接続しました (640×480)")
             }
-        )
-        vendorDriver = driver
-        driver.start(device)
+        }
+
+        override fun onFrame(bmp: Bitmap) {
+            vendorRecorder?.feed(bmp)
+            if (!frozen) {
+                runOnUiThread { binding.liveView.setImageBitmap(bmp) }
+            }
+        }
+
+        override fun onButtonPress() {
+            runOnUiThread {
+                logEvent("本体ボタンが押されました")
+                takePicture()
+            }
+        }
+
+        override fun onStopped(reason: String) {
+            runOnUiThread {
+                logEvent("ベンダー接続終了: $reason")
+                connected = false
+                binding.liveView.visibility = View.GONE
+                updateConnectedUI()
+            }
+        }
+    }
+
+    private fun startVendorDriver(device: UsbDevice) {
+        val usbManager = getSystemService(UsbManager::class.java) ?: return
+        VendorSession.listener = vendorListener
+        binding.liveView.visibility = View.VISIBLE
+        VendorSession.start(usbManager, device) { yuv -> yuvToBitmap(yuv) }
     }
 
     /** YUYV422 (640x480) の生フレームを Bitmap に変換する */
@@ -667,8 +676,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopVendorDriver() {
-        vendorDriver?.stop()
-        vendorDriver = null
+        VendorSession.stop()
     }
 
     private fun buildVendorControls() {
@@ -1582,6 +1590,66 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             "?"
         }
+    }
+
+    // ---------- v0.5.2: 更新通知 ----------
+
+    /** 起動時に GitHub の version.txt と比べて、新しければ知らせる (確認は1日1回まで) */
+    private fun checkForUpdate() {
+        val now = System.currentTimeMillis()
+        if (now - prefs.getLong("last_update_check", 0) < 24 * 60 * 60 * 1000) return
+        prefs.edit().putLong("last_update_check", now).apply()
+        thread {
+            try {
+                val conn = URL(
+                    "https://raw.githubusercontent.com/chinta44/EndoView/main/version.txt"
+                ).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                val remote = conn.inputStream.bufferedReader().use { it.readText() }.trim()
+                conn.disconnect()
+                val current = appVersionName()
+                if (isNewerVersion(remote, current) &&
+                    prefs.getString("update_dismissed", "") != remote
+                ) {
+                    runOnUiThread { showUpdateDialog(remote) }
+                }
+            } catch (e: Exception) {
+                // オフライン等では何もしない
+            }
+        }
+    }
+
+    private fun isNewerVersion(remote: String, current: String): Boolean {
+        val r = remote.split(".").map { it.toIntOrNull() ?: 0 }
+        val c = current.split(".").map { it.toIntOrNull() ?: 0 }
+        for (i in 0 until maxOf(r.size, c.size)) {
+            val rv = r.getOrElse(i) { 0 }
+            val cv = c.getOrElse(i) { 0 }
+            if (rv != cv) return rv > cv
+        }
+        return false
+    }
+
+    private fun showUpdateDialog(remote: String) {
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("新しいバージョンがあります")
+            .setMessage("EndoView v$remote が利用可能です。ダウンロードしますか？")
+            .setPositiveButton("ダウンロード") { _, _ ->
+                startActivity(
+                    Intent(
+                        Intent.ACTION_VIEW,
+                        Uri.parse(
+                            "https://github.com/chinta44/EndoView/releases/download/v0.1/app-debug.apk"
+                        )
+                    )
+                )
+            }
+            .setNegativeButton("あとで") { _, _ ->
+                prefs.edit().putString("update_dismissed", remote).apply()
+            }
+            .show()
     }
 
     private fun toast(msg: String) {
