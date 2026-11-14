@@ -1183,6 +1183,12 @@ class MainActivity : AppCompatActivity() {
             if (controlsLocked) R.drawable.ic_lock else R.drawable.ic_lock_open
         )
         binding.btnLock.alpha = if (controlsLocked) 1f else 0.75f
+        // ロック中は背景をピンクの縁取りにして、ひと目で分かるようにする
+        binding.btnLock.setBackgroundResource(
+            if (controlsLocked) R.drawable.bg_circle_btn_lock else R.drawable.bg_circle_btn
+        )
+        binding.btnLock.contentDescription =
+            if (controlsLocked) "ボタンの自動非表示ロック中" else "ボタンの自動非表示ロック"
     }
 
     /** UVC プレビューを画面いっぱいに表示する (はみ出し分は切り取る) */

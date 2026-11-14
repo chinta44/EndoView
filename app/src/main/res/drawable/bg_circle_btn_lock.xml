@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ロック中を示す丸ボタン背景 (ピンクの太い縁取り) -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#59FF4081" />
+    <stroke
+        android:width="2dp"
+        android:color="#FF4081" />
+</shape>
