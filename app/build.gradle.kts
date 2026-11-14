@@ -11,8 +11,8 @@ android {
         applicationId = "com.chinta44.endoview"
         minSdk = 29
         targetSdk = 34
-        versionCode = 14
-        versionName = "0.5.4"
+        versionCode = 15
+        versionName = "0.5.5"
 
         // 内視鏡は arm 系のみで十分。ライブラリ同梱の so に合わせる
         ndk {
@@ -20,7 +20,23 @@ android {
         }
     }
 
+    // v0.5.5: CI では固定鍵で署名する (環境変数があるときだけ有効。
+    // 鍵が無い環境では従来のデバッグ署名のまま)
+    signingConfigs {
+        create("ci") {
+            storeFile = file(System.getenv("KEYSTORE_PATH") ?: "no-keystore.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+            keyAlias = System.getenv("KEY_ALIAS") ?: ""
+            keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+        }
+    }
+
     buildTypes {
+        debug {
+            if (System.getenv("KEYSTORE_PATH") != null) {
+                signingConfig = signingConfigs.getByName("ci")
+            }
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
